@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""AUV PID Autopilot v40.0 | Правильный знак тяги (как в оригинальном mixer)"""
-import rclpy, math, sys, time
+"""AUV PID Autopilot v41.0 | Курс только рулём, крен ≤5°"""
+import rclpy, math, time
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, Float64
@@ -9,21 +9,19 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 P_Z0  = 101325.0
 RHO_G = 9810.0
 
-XY_TOL        = 2.0
-Z_TOL         = 1.5
-CLIMB_RADIUS  = 12.0
-CLIMB_SPEED   = 1.0    # м/с при Z_CLIMB
-RUDDER_H_RATE = 0.04   # рад/тик rate-limit руля высоты
+XY_TOL        = 2.0    # м
+Z_TOL         = 1.5    # м
+CLIMB_RADIUS  = 12.0   # м
+CLIMB_SPEED   = 1.0    # м/с
+RUDDER_H_RATE = 0.03   # рад/тик — rate-limit руля высоты
 
-ROLL_WARN_DEG  = 25.0
-ROLL_RECOV_DEG = 50.0
+# Крен: жёсткий порог. При превышении — RECOVERY.
+ROLL_MAX_DEG   = 5.0   # желаемый максимум в обычном полёте
+ROLL_RECOV_DEG = 20.0  # порог входа в RECOVERY
 
-# Оригинальный mixer использует отрицательную тягу для движения вперёд:
-#   thr_l = -(cmd_thrust + cmd_diff)
-# Поэтому: FORWARD_THRUST отрицательный, большее |значение| = быстрее вперёд
 def fwd(speed):
-    """Преобразует желаемую скорость (>0) в команду тяги (отриц. = вперёд)."""
-    return -speed * 3.3
+    """Тяга вперёд: отрицательная команда = движение вперёд в этой SDF."""
+    return -abs(speed) * 3.3
 
 class AUVController(Node):
     def __init__(self):
@@ -59,15 +57,30 @@ class AUVController(Node):
         self.prev_r_err   = 0.0
         self.last_log_t   = 0.0
 
-        self.max_cruise  = 2.2
-        self.min_cruise  = 0.8
+        # Скорость
+        self.cruise_speed = 1.2   # умеренная — меньше кренящего момента
 
-        self.Kp_z = 2.5;   self.Kd_z = 0.8
-        self.Kp_yaw = 1.8; self.Kd_yaw = 0.5
-        self.K_diff_base = 3.0
-        self.Kp_roll = 8.0; self.Kd_roll = 3.0
+        # PD по Z
+        self.Kp_z = 2.5
+        self.Kd_z = 0.8
+
+        # PD по курсу — ТОЛЬКО через вертикальный руль
+        self.Kp_yaw = 2.5   # увеличен — руль должен успевать
+        self.Kd_yaw = 0.8
+
+        # Стабилизация крена через горизонтальные рули (дифференциально)
+        # Высокий Kp чтобы гасить крен быстро
+        self.Kp_roll = 20.0
+        self.Kd_roll = 6.0
         self.roll_bias = 0.04
-        self.Kp_r = 0.06;  self.Kd_r = 0.18
+
+        # Дифференциал моторов для курса — очень малый, только помощник
+        # Основное управление курсом — rudder_v
+        self.K_diff = 0.5   # было 3.0 — это и было причиной крена!
+
+        # PD по радиусу (Z_CLIMB)
+        self.Kp_r = 0.06
+        self.Kd_r = 0.18
 
         self.dt = 0.05
         self.timer = self.create_timer(self.dt, self.loop)
@@ -92,7 +105,7 @@ class AUVController(Node):
             self.prev_baro_z  = self.baro_z
             self.hold_bearing = self.rpy[2]
             self.state = 'STAB'
-            print(f"\n🎯 AUV v40.0")
+            print(f"\n🎯 AUV v41.0")
             print(f"   Цель:  X={self.target[0]:.1f} Y={self.target[1]:.1f} Z={self.target[2]:.1f}")
             print(f"   Старт: X={self.pos[0]:.1f} Y={self.pos[1]:.1f} Z={self.pos[2]:.1f}")
 
@@ -106,7 +119,7 @@ class AUVController(Node):
             r_err  = self.dist_2d - CLIMB_RADIUS
             dr_err = (r_err - self.prev_r_err) / self.dt
             self.prev_r_err = r_err
-            correction = max(-0.7, min(0.7,
+            correction = max(-0.5, min(0.5,
                 -(self.Kp_r * r_err + self.Kd_r * dr_err)))
             self.bearing = angle_to_sub + math.pi / 2 + correction
         elif self.state == 'HOLD':
@@ -123,7 +136,7 @@ class AUVController(Node):
         roll_deg = math.degrees(roll_rad)
         now      = time.time()
 
-        # ── RECOVERY ─────────────────────────────────────────────────
+        # ── RECOVERY при крене > 20° ──────────────────────────────────
         if self.state != 'RECOVERY' and abs(roll_deg) > ROLL_RECOV_DEG:
             self.prev_state = self.state
             self.recov_t    = 0.0
@@ -133,16 +146,20 @@ class AUVController(Node):
         if self.state == 'RECOVERY':
             self.recov_t += self.dt
             d_roll = (roll_rad - self.prev_rpy[0]) / self.dt
+            # Кратчайший путь к roll=0
             roll_err_signed = math.atan2(math.sin(-roll_rad), math.cos(-roll_rad))
             roll_cmd = max(-0.6, min(0.6,
                 self.Kp_roll * roll_err_signed - self.Kd_roll * d_roll))
+
+            # Горизонтальные рули: только выравнивание крена
             cmd_hl = max(-0.6, min(0.6, -roll_cmd - self.roll_bias))
             cmd_hr = max(-0.6, min(0.6,  roll_cmd + self.roll_bias))
-            # Тяга вперёд (отрицательная) чтобы рули имели авторитет
+            # Вертикальный руль — нейтраль
+            # Тяга одинаковая на оба мотора (без дифференциала!) — не кренит
             t = fwd(0.8)
             self.prev_rpy = list(self.rpy)
 
-            if abs(roll_deg) < ROLL_WARN_DEG and self.recov_t > 1.0:
+            if abs(roll_deg) < ROLL_MAX_DEG and self.recov_t > 0.5:
                 self.rudder_h_cur = 0.0
                 self.dz_filt      = 0.0
                 self.state = self.prev_state
@@ -154,7 +171,7 @@ class AUVController(Node):
                 print(f"\n[RECOVERY   ] крен:{roll_deg:+.1f}° cmd:{roll_cmd:+.2f} t:{self.recov_t:.1f}с")
             return
 
-        # ── PD по Z ───────────────────────────────────────────────────
+        # ── PD по Z с фильтрацией и rate-limit ───────────────────────
         dz_dt = (self.pos[2] - self.prev_baro_z) / self.dt
         self.dz_filt = 0.6 * self.dz_filt + 0.4 * dz_dt
         raw_h = -(self.Kp_z * z_err + self.Kd_z * self.dz_filt)
@@ -164,7 +181,7 @@ class AUVController(Node):
         rudder_h = self.rudder_h_cur
         self.prev_baro_z = self.pos[2]
 
-        # ── PD по курсу ───────────────────────────────────────────────
+        # ── PD по курсу → ТОЛЬКО вертикальный руль ───────────────────
         yaw_err = math.atan2(math.sin(self.bearing - self.rpy[2]),
                               math.cos(self.bearing - self.rpy[2]))
         if abs(math.degrees(yaw_err)) < 1.0:
@@ -173,23 +190,26 @@ class AUVController(Node):
         rudder_v = max(-0.45, min(0.45,
             self.Kp_yaw * yaw_err + self.Kd_yaw * d_yaw))
 
-        # ── Крен ──────────────────────────────────────────────────────
+        # ── Крен: горизонтальные рули дифференциально ─────────────────
         d_roll = (roll_rad - self.prev_rpy[0]) / self.dt
         roll_err_signed = math.atan2(math.sin(-roll_rad), math.cos(-roll_rad))
         roll_pid = self.Kp_roll * roll_err_signed - self.Kd_roll * d_roll
-        if abs(roll_deg) > ROLL_WARN_DEG:
-            roll_pid *= min(1.0 + (abs(roll_deg) - ROLL_WARN_DEG) / 20.0, 2.5)
 
+        # Горизонтальный руль = компонента высоты ± компонента крена
         cmd_hl = max(-0.6, min(0.6, rudder_h - roll_pid - self.roll_bias))
         cmd_hr = max(-0.6, min(0.6, rudder_h + roll_pid + self.roll_bias))
         self.prev_rpy = list(self.rpy)
+
+        # ── Базовая тяга: одинаковая на оба мотора ────────────────────
+        # Малый дифференциал только как помощник рулю — не кренит корпус
+        diff = max(-2.0, min(2.0, self.K_diff * yaw_err))  # очень малый
 
         thrust = 0.0; cmd_lt = 0.0; cmd_rt = 0.0
 
         # ══════════════════════════════════════════════════════════════
 
         if self.state == 'STAB':
-            if abs(roll_deg) < 7.0:
+            if abs(roll_deg) < 3.0:
                 self.stable_t += self.dt
             else:
                 self.stable_t = 0.0
@@ -202,19 +222,16 @@ class AUVController(Node):
             cmd_lt = thrust; cmd_rt = thrust
 
         elif self.state == 'NAV':
-            target_speed = max(self.min_cruise, min(self.max_cruise, self.dist_2d * 0.35))
-
-            # vel > 0 = вперёд (правильно), vel < 0 = назад (неправильно)
-            # fwd() возвращает отрицательное число — это тяга вперёд
-            if self.vel < target_speed - 0.2:
-                thrust = fwd(target_speed)        # разгон
-            elif self.vel > target_speed + 0.2:
-                thrust = fwd(target_speed * 0.3)  # притормозить
+            # Скорость: плавно тормозим при подходе к цели
+            target_speed = max(0.6, min(self.cruise_speed, self.dist_2d * 0.2))
+            if self.vel < target_speed - 0.15:
+                thrust = fwd(target_speed)
+            elif self.vel > target_speed + 0.15:
+                thrust = fwd(target_speed * 0.3)
             else:
-                thrust = fwd(target_speed * 0.7)  # держать скорость
+                thrust = fwd(target_speed * 0.7)
 
-            k_diff = self.K_diff_base * (1.0 + abs(self.vel))
-            diff   = k_diff * yaw_err
+            # Дифференциал моторов минимальный — не кренит
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
 
@@ -236,14 +253,8 @@ class AUVController(Node):
             else:
                 thrust = fwd(CLIMB_SPEED * 0.7)
 
-            k_diff = self.K_diff_base * (1.0 + abs(self.vel))
-            diff   = k_diff * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
-
-            if abs(roll_deg) > ROLL_RECOV_DEG:
-                cmd_lt = thrust; cmd_rt = thrust
-                rudder_v = 0.0
 
             if abs(z_err) < Z_TOL:
                 self.hold_bearing = self.rpy[2]
@@ -251,14 +262,13 @@ class AUVController(Node):
                 print(f"\n✅ HOLD  X={self.pos[0]:.2f} Y={self.pos[1]:.2f} Z={self.pos[2]:.2f}")
 
         elif self.state == 'HOLD':
-            hold_speed = 0.8
+            hold_speed = 0.6
             if self.vel < hold_speed - 0.05:
                 thrust = fwd(hold_speed)
             elif self.vel > hold_speed + 0.05:
                 thrust = fwd(hold_speed * 0.3)
             else:
                 thrust = fwd(hold_speed * 0.6)
-            diff   = self.K_diff_base * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
 
@@ -269,7 +279,8 @@ class AUVController(Node):
             print(f"\n[{self.state:10}] "
                   f"Pos:[{self.pos[0]:+6.1f} {self.pos[1]:+6.1f} {self.pos[2]:+7.2f}] | "
                   f"D2D:{self.dist_2d:6.1f}m  Z_err:{z_err:+7.2f}m | "
-                  f"rh:{self.rudder_h_cur:+.2f}  V:{self.vel:+.2f}  Roll:{roll_deg:+5.1f}°")
+                  f"rh:{rudder_h:+.2f} rv:{rudder_v:+.2f} | "
+                  f"V:{self.vel:+.2f}  Roll:{roll_deg:+5.1f}°")
 
     def _pub(self, lt, rt, rv, hl, hr):
         self.pub_lt.publish(Float64(data=float(lt)))
@@ -281,7 +292,7 @@ class AUVController(Node):
     def run(self):
         try:
             print("=" * 60)
-            print("🚢 AUV v40.0")
+            print("🚢 AUV v41.0 — крен ≤5°, курс только рулём")
             print("   Ось Z вверх+. Всплытие = большее Z.")
             print("=" * 60)
             self.raw_target_x = float(input("📍 X цели (м): "))
